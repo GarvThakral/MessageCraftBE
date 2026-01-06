@@ -4,15 +4,28 @@ import inspect
 import json
 import os
 import re
+import uuid
+from datetime import date
 from functools import lru_cache
 from typing import Any, TYPE_CHECKING
 
-import stripe
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, ValidationError
+
+from db import (
+    contact_exists,
+    count_contacts,
+    fetch_conversation_entries,
+    get_next_week_start,
+    get_usage_count,
+    get_week_start,
+    increment_usage,
+    insert_conversation_entry,
+    touch_session,
+)
 
 load_dotenv()
 
@@ -110,6 +123,13 @@ class Explanations(BaseModel):
     change_log: list[str]
 
 
+class UsageMeta(BaseModel):
+    tier: str
+    count: int
+    limit: int | None
+    reset_at: str
+
+
 class MessageCraftResponse(BaseModel):
     context: ContextInfo
     tone_versions: ToneVersions
@@ -120,6 +140,7 @@ class MessageCraftResponse(BaseModel):
     quick_actions: QuickActions
     usp: UniqueSellingPoints
     explanations: Explanations
+    meta: UsageMeta | None = None
 
 
 class TranslateRequest(BaseModel):
@@ -131,27 +152,42 @@ class TranslateResponse(BaseModel):
     output: str
 
 
-class CheckoutSessionRequest(BaseModel):
-    plan: str
-    billing_cycle: str
-    success_url: str | None = None
-    cancel_url: str | None = None
+class UsageResponse(BaseModel):
+    tier: str
+    count: int
+    limit: int | None
+    reset_at: str
 
 
-class CheckoutSessionResponse(BaseModel):
-    url: str
-
-
-class PortalSessionRequest(BaseModel):
-    customer_id: str
-    return_url: str | None = None
-
-
-class PortalSessionResponse(BaseModel):
-    url: str
-
+class ConversationEntryRequest(BaseModel):
+    contact: str
+    input_text: str
+    output_text: str
+    tone_key: str
+    tone_scores: ToneScores
+    impact_prediction: int
+    clarity_before: int
+    clarity_after: int
 
 app = FastAPI(title="MessageCraft Pro Backend")
+
+TIER_LIMITS = {
+    "FREE": 3,
+    "STARTER": 25,
+    "PRO": None,
+}
+
+TIER_TONE_LIMITS = {
+    "FREE": 3,
+    "STARTER": 5,
+    "PRO": 5,
+}
+
+CONTACT_LIMITS = {
+    "FREE": 0,
+    "STARTER": 5,
+    "PRO": None,
+}
 
 
 def _parse_origins(value: str | None) -> list[str]:
@@ -167,6 +203,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _normalize_tier(value: str | None) -> str:
+    if not value:
+        return "FREE"
+    normalized = value.strip().upper()
+    if normalized in TIER_LIMITS:
+        return normalized
+    return "FREE"
+
+
+def _get_session_id(request: Request) -> str:
+    session_id = request.headers.get("x-session-id") or request.headers.get("X-Session-Id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session id.")
+    return session_id.strip()
+
+
+def _get_tier(request: Request) -> str:
+    return _normalize_tier(request.headers.get("x-user-tier") or request.headers.get("X-User-Tier"))
+
+
+def _build_usage_meta(tier: str, count: int, week_start: date) -> UsageMeta:
+    limit = TIER_LIMITS[tier]
+    reset_at = get_next_week_start(week_start).isoformat()
+    return UsageMeta(tier=tier, count=count, limit=limit, reset_at=reset_at)
 
 
 MESSAGECRAFT_SCHEMA = """
@@ -238,25 +300,35 @@ Return JSON with this schema:
 
 
 def _build_messagecraft_prompt(request: MessageCraftRequest) -> str:
-    audience = request.audience_style or "neutral"
+    audience = request.audience_style or "Gen Z"
     tone_balance = "balanced" if request.tone_balance is None else str(request.tone_balance)
     goal = request.user_goal or "general clarity and respect"
+    style_notes: list[str] = []
+    audience_lower = audience.lower()
+    if "gen" in audience_lower and "z" in audience_lower:
+        style_notes.append(
+            "Style: casual Gen Z, short lines, contractions, no corporate/therapy phrasing."
+        )
+    if "de-escalat" in goal.lower():
+        style_notes.append(
+            "De-escalate: calm, non-accusatory, keep emotional truth, remove insults."
+        )
+    style_hint = " ".join(style_notes)
 
     return (
-        "You are MessageCraft Pro, an expert communication strategist. "
-        "Analyze the input message and return ONE JSON object that matches the schema. "
-        "Do not include markdown or extra text.\n\n"
-        f"Audience style target: {audience}. "
-        f"Tone balance target (0-100, low=emotional high=logical): {tone_balance}. "
-        f"Primary user goal: {goal}.\n\n"
-        "Rules:"
-        "\n- Provide 5 complete rewrites in tone_versions."
-        "\n- Scores are integers 0-100. after_clarity_score must be >= before_clarity_score."
-        "\n- relationship_impact_prediction is 0-100 percent chance of positive response."
-        "\n- Keep warnings short, actionable, and non-judgmental."
-        "\n- If no red flags exist, return empty arrays."
-        "\n- Use plain text, avoid emojis unless the original text includes them."
-        "\n\n"
+        "Return ONE JSON object that matches the schema exactly. No markdown or extra text. "
+        "Preserve intent. Do not add new facts, decisions, or requests. "
+        "If the input is ambiguous, keep it ambiguous. "
+        "Keep length close to the original (about +/- 30%). Use short sentences. "
+        "Avoid corporate or therapy jargon unless the input uses it. "
+        f"Audience style: {audience}. "
+        f"Tone balance (0-100, low=emotional high=logical): {tone_balance}. "
+        f"Primary goal: {goal}. "
+        f"{style_hint} "
+        "Provide all fields. Use empty arrays when none. "
+        "Scores are integers 0-100; after_clarity_score >= before_clarity_score. "
+        "relationship_impact_prediction is 0-100. "
+        "Use plain text; avoid emojis unless the original text includes them.\n\n"
         + MESSAGECRAFT_SCHEMA
     )
 
@@ -368,20 +440,65 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise ValueError("Unable to parse JSON from model response.")
 
 
-def _price_id(plan: str, billing_cycle: str) -> str:
-    plan_key = plan.upper()
-    cycle_key = billing_cycle.lower()
+def _empty_tactical() -> TacticalEnhancements:
+    return TacticalEnhancements(
+        add_emotional_validation="",
+        remove_emotional_validation="",
+        include_action_items="",
+        exclude_action_items="",
+        add_softeners="",
+        add_strengtheners="",
+        insert_boundaries="",
+        frame_as_question="",
+        frame_as_statement="",
+    )
 
-    if plan_key == "STARTER" and cycle_key == "weekly":
-        return _env("STRIPE_STARTER_WEEKLY_PRICE_ID", "") or ""
-    if plan_key == "STARTER" and cycle_key == "monthly":
-        return _env("STRIPE_STARTER_MONTHLY_PRICE_ID", "") or ""
-    if plan_key == "PRO" and cycle_key == "weekly":
-        return _env("STRIPE_PRO_WEEKLY_PRICE_ID", "") or ""
-    if plan_key == "PRO" and cycle_key == "monthly":
-        return _env("STRIPE_PRO_MONTHLY_PRICE_ID", "") or ""
 
-    raise HTTPException(status_code=400, detail="Unsupported plan or billing cycle.")
+def _empty_scenarios() -> OneClickScenarios:
+    return OneClickScenarios(
+        boundary_setting="",
+        clarifying_question="",
+        accountability_without_blame="",
+        collaborative_proposal="",
+        non_defensive_response="",
+    )
+
+
+def _empty_quick_actions() -> QuickActions:
+    return QuickActions(
+        condense="",
+        expand="",
+        cool_down="",
+        add_assertiveness="",
+    )
+
+
+def _empty_red_flags() -> RedFlags:
+    return RedFlags(
+        manipulative_patterns=[],
+        defensive_phrases=[],
+        assumptions=[],
+        escalation_triggers=[],
+    )
+
+
+def _apply_tier_limits(response: MessageCraftResponse, tier: str) -> MessageCraftResponse:
+    if tier == "FREE":
+        response.tone_versions.diplomatic_tactful = ""
+        response.tone_versions.casual_friendly = ""
+        response.analysis.misinterpretation_warnings = []
+        response.analysis.power_dynamics = "unknown"
+        response.analysis.urgency = "low"
+        response.analysis.framework_tags = []
+        response.tactical_enhancements = _empty_tactical()
+        response.quick_actions = _empty_quick_actions()
+        response.one_click_scenarios = _empty_scenarios()
+        response.red_flags = _empty_red_flags()
+
+    if tier == "STARTER":
+        response.one_click_scenarios = _empty_scenarios()
+
+    return response
 
 
 @app.get("/health")
@@ -389,8 +506,33 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/usage", response_model=UsageResponse)
+def get_usage(raw_request: Request) -> UsageResponse:
+    session_id = _get_session_id(raw_request)
+    tier = _get_tier(raw_request)
+    touch_session(session_id)
+    week_start = get_week_start()
+    count = get_usage_count(session_id, week_start)
+    meta = _build_usage_meta(tier, count, week_start)
+    return UsageResponse(**meta.model_dump())
+
+
 @app.post("/api/messagecraft", response_model=MessageCraftResponse)
-def messagecraft(request: MessageCraftRequest) -> MessageCraftResponse:
+def messagecraft(request: MessageCraftRequest, raw_request: Request) -> MessageCraftResponse:
+    session_id = _get_session_id(raw_request)
+    tier = _get_tier(raw_request)
+    touch_session(session_id)
+
+    week_start = get_week_start()
+    limit = TIER_LIMITS[tier]
+    count = get_usage_count(session_id, week_start)
+    if limit is not None and count >= limit:
+        reset_at = get_next_week_start(week_start).isoformat()
+        raise HTTPException(
+            status_code=429,
+            detail={"message": "Weekly translation limit reached.", "reset_at": reset_at},
+        )
+
     text = request.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Missing input text.")
@@ -408,7 +550,59 @@ def messagecraft(request: MessageCraftRequest) -> MessageCraftResponse:
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return parsed
+    new_count = increment_usage(session_id, week_start, 1)
+    parsed.meta = _build_usage_meta(tier, new_count, week_start)
+    return _apply_tier_limits(parsed, tier)
+
+
+@app.post("/api/conversations")
+def create_conversation(entry: ConversationEntryRequest, raw_request: Request) -> dict[str, str]:
+    session_id = _get_session_id(raw_request)
+    tier = _get_tier(raw_request)
+    if tier == "FREE":
+        raise HTTPException(status_code=403, detail="Conversation memory is not available on Free.")
+
+    contact = entry.contact.strip()
+    if not contact:
+        raise HTTPException(status_code=400, detail="Contact is required.")
+
+    touch_session(session_id)
+
+    limit = CONTACT_LIMITS[tier]
+    if limit is not None and not contact_exists(session_id, contact):
+        current_contacts = count_contacts(session_id)
+        if current_contacts >= limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Contact limit reached for {tier}.",
+            )
+
+    insert_conversation_entry(
+        entry_id=str(uuid.uuid4()),
+        session_id=session_id,
+        contact=contact,
+        input_text=entry.input_text,
+        output_text=entry.output_text,
+        tone_key=entry.tone_key,
+        tone_scores=entry.tone_scores.model_dump(),
+        impact_prediction=entry.impact_prediction,
+        clarity_before=entry.clarity_before,
+        clarity_after=entry.clarity_after,
+    )
+
+    return {"status": "saved"}
+
+
+@app.get("/api/conversations")
+def list_conversations(raw_request: Request, contact: str | None = None) -> dict[str, Any]:
+    session_id = _get_session_id(raw_request)
+    tier = _get_tier(raw_request)
+    if tier == "FREE":
+        return {"entries": []}
+
+    touch_session(session_id)
+    entries = fetch_conversation_entries(session_id=session_id, contact=contact)
+    return {"entries": entries}
 
 
 @app.post("/api/translate", response_model=TranslateResponse)
@@ -428,95 +622,3 @@ def translate(request: TranslateRequest) -> TranslateResponse:
 
     content = getattr(response, "content", None) or str(response)
     return TranslateResponse(output=content)
-
-
-@app.post("/api/stripe/checkout-session", response_model=CheckoutSessionResponse)
-def create_checkout_session(payload: CheckoutSessionRequest) -> CheckoutSessionResponse:
-    stripe.api_key = _env("STRIPE_SECRET_KEY")
-    if not stripe.api_key:
-        raise HTTPException(status_code=500, detail="Stripe is not configured.")
-
-    price_id = _price_id(payload.plan, payload.billing_cycle)
-    if not price_id:
-        raise HTTPException(status_code=500, detail="Stripe price ID is missing.")
-
-    success_url = payload.success_url or _env("STRIPE_SUCCESS_URL", "http://localhost:5173")
-    cancel_url = payload.cancel_url or _env("STRIPE_CANCEL_URL", "http://localhost:5173/pricing")
-
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=f"{success_url}?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=cancel_url,
-        allow_promotion_codes=True,
-    )
-
-    return CheckoutSessionResponse(url=session.url)
-
-
-@app.get("/api/stripe/session")
-def get_checkout_session(session_id: str) -> dict[str, str]:
-    stripe.api_key = _env("STRIPE_SECRET_KEY")
-    if not stripe.api_key:
-        raise HTTPException(status_code=500, detail="Stripe is not configured.")
-
-    session = stripe.checkout.Session.retrieve(session_id)
-    price_id = ""
-    customer_id = ""
-    if session and session.get("subscription"):
-        subscription = stripe.Subscription.retrieve(session["subscription"])
-        if subscription and subscription.get("items"):
-            price_id = subscription["items"]["data"][0]["price"]["id"]
-    if session and session.get("customer"):
-        customer_id = session["customer"]
-
-    tier = "FREE"
-    if price_id in (
-        _env("STRIPE_STARTER_WEEKLY_PRICE_ID"),
-        _env("STRIPE_STARTER_MONTHLY_PRICE_ID"),
-    ):
-        tier = "STARTER"
-    if price_id in (
-        _env("STRIPE_PRO_WEEKLY_PRICE_ID"),
-        _env("STRIPE_PRO_MONTHLY_PRICE_ID"),
-    ):
-        tier = "PRO"
-
-    return {"tier": tier, "customer_id": customer_id}
-
-
-@app.post("/api/stripe/portal-session", response_model=PortalSessionResponse)
-def create_portal_session(payload: PortalSessionRequest) -> PortalSessionResponse:
-    stripe.api_key = _env("STRIPE_SECRET_KEY")
-    if not stripe.api_key:
-        raise HTTPException(status_code=500, detail="Stripe is not configured.")
-
-    if not payload.customer_id:
-        raise HTTPException(status_code=400, detail="Customer ID is required.")
-
-    return_url = payload.return_url or _env("STRIPE_PORTAL_RETURN_URL", "http://localhost:5173")
-
-    session = stripe.billing_portal.Session.create(
-        customer=payload.customer_id,
-        return_url=return_url,
-    )
-
-    return PortalSessionResponse(url=session.url)
-
-
-@app.post("/api/stripe/webhook")
-async def stripe_webhook(request: Request) -> dict[str, bool]:
-    stripe.api_key = _env("STRIPE_SECRET_KEY")
-    webhook_secret = _env("STRIPE_WEBHOOK_SECRET")
-    if not stripe.api_key or not webhook_secret:
-        raise HTTPException(status_code=500, detail="Stripe webhook not configured.")
-
-    payload = await request.body()
-    signature = request.headers.get("stripe-signature")
-
-    try:
-        stripe.Webhook.construct_event(payload, signature, webhook_secret)
-    except Exception as exc:  # pragma: no cover
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {"received": True}
