@@ -290,6 +290,8 @@ def _llm_kwargs(
     max_tokens: int | None,
     headers: dict[str, str],
 ) -> dict:
+    from langchain_openai import ChatOpenAI
+
     signature = inspect.signature(ChatOpenAI.__init__)
     params = signature.parameters
     kwargs: dict[str, object] = {"model": model}
