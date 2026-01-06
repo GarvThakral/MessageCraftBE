@@ -5,17 +5,25 @@ import json
 import os
 import re
 from functools import lru_cache
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import stripe
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 load_dotenv()
+
+if os.getenv("OPENROUTER_API_KEY"):
+    os.environ.setdefault("OPENAI_API_KEY", os.getenv("OPENROUTER_API_KEY"))
+if os.getenv("OPENROUTER_BASE_URL"):
+    os.environ.setdefault("OPENAI_BASE_URL", os.getenv("OPENROUTER_BASE_URL"))
+    os.environ.setdefault("OPENAI_API_BASE", os.getenv("OPENROUTER_BASE_URL"))
+
+if TYPE_CHECKING:
+    from langchain_openai import ChatOpenAI
 
 
 class MessageCraftRequest(BaseModel):
@@ -308,7 +316,9 @@ def _llm_kwargs(
 
 
 @lru_cache(maxsize=1)
-def _get_llm() -> ChatOpenAI:
+def _get_llm() -> "ChatOpenAI":
+    from langchain_openai import ChatOpenAI
+
     api_key = _env("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set.")
@@ -329,6 +339,10 @@ def _get_llm() -> ChatOpenAI:
         headers["HTTP-Referer"] = app_url
     if app_name:
         headers["X-Title"] = app_name
+
+    os.environ.setdefault("OPENAI_API_KEY", api_key)
+    os.environ.setdefault("OPENAI_BASE_URL", base_url)
+    os.environ.setdefault("OPENAI_API_BASE", base_url)
 
     return ChatOpenAI(
         **_llm_kwargs(
