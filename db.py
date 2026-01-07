@@ -27,6 +27,17 @@ def ensure_schema() -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    tier TEXT NOT NULL DEFAULT 'FREE',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -67,6 +78,35 @@ def ensure_schema() -> None:
                 ON conversation_entries (session_id, contact, created_at DESC);
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rate_limits (
+                    key TEXT NOT NULL,
+                    window_start TIMESTAMPTZ NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (key, window_start)
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payments (
+                    id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    tier TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    raw JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS rate_limits_window_idx
+                ON rate_limits (window_start);
+                """
+            )
 
 
 def get_week_start(now: datetime | None = None) -> date:
@@ -82,6 +122,18 @@ def get_next_week_start(week_start: date) -> datetime:
     )
 
 
+def get_day_start(now: datetime | None = None) -> date:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return date(now.year, now.month, now.day)
+
+
+def get_next_day_start(day_start: date) -> datetime:
+    return datetime.combine(day_start, datetime.min.time(), tzinfo=timezone.utc) + timedelta(
+        days=1
+    )
+
+
 def touch_session(session_id: str) -> None:
     ensure_schema()
     with get_connection() as conn:
@@ -94,6 +146,44 @@ def touch_session(session_id: str) -> None:
                 """,
                 (session_id,),
             )
+
+
+def create_user(*, user_id: str, username: str, password_hash: str, tier: str) -> None:
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (id, username, password_hash, tier)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (user_id, username, password_hash, tier),
+            )
+
+
+def get_user_by_username(username: str) -> dict[str, Any] | None:
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def get_user_by_id(user_id: str) -> dict[str, Any] | None:
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def update_user_tier(user_id: str, tier: str) -> None:
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET tier = %s WHERE id = %s", (tier, user_id))
 
 
 def get_usage_count(session_id: str, week_start: date) -> int:
@@ -228,3 +318,45 @@ def fetch_conversation_entries(
                 )
             rows = cur.fetchall()
             return [dict(row) for row in rows]
+
+
+def increment_rate_limit(key: str, window_start: datetime) -> int:
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO rate_limits (key, window_start, count)
+                VALUES (%s, %s, 1)
+                ON CONFLICT (key, window_start)
+                DO UPDATE SET count = rate_limits.count + 1
+                RETURNING count
+                """,
+                (key, window_start),
+            )
+            row = cur.fetchone()
+            return int(row["count"]) if row else 1
+
+
+def insert_payment(
+    *,
+    payment_id: str,
+    provider: str,
+    user_id: str,
+    tier: str,
+    status: str,
+    raw: dict[str, Any],
+) -> bool:
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO payments (id, provider, user_id, tier, status, raw)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+                """,
+                (payment_id, provider, user_id, tier, status, Jsonb(raw)),
+            )
+            return cur.fetchone() is not None

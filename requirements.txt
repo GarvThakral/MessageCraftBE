@@ -4,3 +4,4 @@ python-dotenv
 psycopg[binary]
 langchain
 langchain-openai
+standardwebhooks

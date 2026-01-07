@@ -5,26 +5,39 @@ import json
 import os
 import re
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from typing import Any, TYPE_CHECKING
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from standardwebhooks import Webhook
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, ValidationError
+import psycopg
+
+from auth import create_token, hash_password, verify_password, verify_token
 
 from db import (
     contact_exists,
     count_contacts,
+    create_user,
     fetch_conversation_entries,
+    get_day_start,
+    get_next_day_start,
     get_next_week_start,
     get_usage_count,
+    get_user_by_id,
+    get_user_by_username,
     get_week_start,
     increment_usage,
+    increment_rate_limit,
+    insert_payment,
     insert_conversation_entry,
     touch_session,
+    update_user_tier,
 )
 
 load_dotenv()
@@ -169,10 +182,38 @@ class ConversationEntryRequest(BaseModel):
     clarity_before: int
     clarity_after: int
 
+
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    tier: str
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserResponse
+
+
+class TierUpdateRequest(BaseModel):
+    tier: str
+
+
+class DodoCheckoutRequest(BaseModel):
+    tier: str
+
+
+class DodoCheckoutResponse(BaseModel):
+    checkout_url: str
+
 app = FastAPI(title="MessageCraft Pro Backend")
 
 TIER_LIMITS = {
-    "FREE": 3,
+    "FREE": 1,
     "STARTER": 25,
     "PRO": None,
 }
@@ -214,20 +255,14 @@ def _normalize_tier(value: str | None) -> str:
     return "FREE"
 
 
-def _get_session_id(request: Request) -> str:
-    session_id = request.headers.get("x-session-id") or request.headers.get("X-Session-Id")
-    if not session_id:
-        raise HTTPException(status_code=400, detail="Missing session id.")
-    return session_id.strip()
 
 
-def _get_tier(request: Request) -> str:
-    return _normalize_tier(request.headers.get("x-user-tier") or request.headers.get("X-User-Tier"))
-
-
-def _build_usage_meta(tier: str, count: int, week_start: date) -> UsageMeta:
+def _build_usage_meta(tier: str, count: int, period_start: date) -> UsageMeta:
     limit = TIER_LIMITS[tier]
-    reset_at = get_next_week_start(week_start).isoformat()
+    if tier == "FREE":
+        reset_at = get_next_day_start(period_start).isoformat()
+    else:
+        reset_at = get_next_week_start(period_start).isoformat()
     return UsageMeta(tier=tier, count=count, limit=limit, reset_at=reset_at)
 
 
@@ -352,6 +387,146 @@ def _env(name: str, default: str | None = None) -> str | None:
     if value is None or value.strip() == "":
         return default
     return value
+
+
+RATE_LIMITS = {
+    "FREE": int(_env("RATE_LIMIT_FREE_PER_MINUTE", "10") or 10),
+    "STARTER": int(_env("RATE_LIMIT_STARTER_PER_MINUTE", "30") or 30),
+    "PRO": int(_env("RATE_LIMIT_PRO_PER_MINUTE", "60") or 60),
+}
+
+RATE_LIMIT_IP = int(_env("RATE_LIMIT_IP_PER_MINUTE", "120") or 120)
+RATE_LIMIT_AUTH = int(_env("RATE_LIMIT_AUTH_PER_MINUTE", "20") or 20)
+
+
+def _auth_secret() -> str:
+    secret = _env("AUTH_SECRET")
+    if not secret:
+        raise RuntimeError("AUTH_SECRET is not set.")
+    return secret
+
+
+def _token_ttl_seconds() -> int:
+    return int(_env("AUTH_TOKEN_TTL_SECONDS", "604800") or 604800)
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _require_user(request: Request) -> dict[str, Any]:
+    header = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not header or not header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing auth token.")
+    token = header.split(" ", 1)[1].strip()
+    try:
+        payload = verify_token(token, _auth_secret())
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid auth token.")
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found.")
+    return user
+
+
+def _effective_tier(request: Request, user: dict[str, Any]) -> str:
+    allow_override = (_env("ALLOW_TIER_OVERRIDE") or "").lower() in {"1", "true", "yes"}
+    if allow_override:
+        raw_override = request.headers.get("x-user-tier") or request.headers.get("X-User-Tier")
+        if raw_override:
+            return _normalize_tier(raw_override)
+    return _normalize_tier(user.get("tier"))
+
+
+def _rate_limit(request: Request, tier: str, user_id: str) -> None:
+    window_start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    user_key = f"user:{user_id}"
+    user_count = increment_rate_limit(user_key, window_start)
+    limit = RATE_LIMITS.get(tier, RATE_LIMITS["FREE"])
+    if user_count > limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please slow down and try again.",
+        )
+
+    ip = _get_client_ip(request)
+    if ip:
+        ip_count = increment_rate_limit(f"ip:{ip}", window_start)
+        if ip_count > RATE_LIMIT_IP:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests from this network. Please try again later.",
+            )
+
+
+def _rate_limit_auth(request: Request) -> None:
+    window_start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    ip = _get_client_ip(request)
+    if not ip:
+        return
+    ip_count = increment_rate_limit(f"auth:{ip}", window_start)
+    if ip_count > RATE_LIMIT_AUTH:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many authentication attempts. Please try again shortly.",
+        )
+
+
+def _dodo_return_url() -> str:
+    return_url = _env("DODO_RETURN_URL")
+    if not return_url:
+        raise RuntimeError("DODO_RETURN_URL is not set.")
+    return return_url
+
+
+def _dodo_link_for_tier(tier: str) -> str:
+    if tier == "STARTER":
+        link = _env("DODO_STARTER_LINK")
+    elif tier == "PRO":
+        link = _env("DODO_PRO_LINK")
+    else:
+        link = None
+    if not link:
+        raise RuntimeError("Dodo payment link is not configured.")
+    return link
+
+
+def _dodo_metadata_token_ttl_seconds() -> int:
+    return int(_env("DODO_METADATA_TOKEN_TTL_SECONDS", "7200") or 7200)
+
+
+def _build_dodo_checkout_url(link: str, user_id: str, tier: str) -> str:
+    parsed = urlparse(link)
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    params.setdefault("quantity", "1")
+    params["redirect_url"] = _dodo_return_url()
+    params["metadata_user_id"] = user_id
+    params["metadata_tier"] = tier
+    params["metadata_token"] = create_token(
+        {"sub": user_id, "tier": tier},
+        _auth_secret(),
+        _dodo_metadata_token_ttl_seconds(),
+    )
+    query = urlencode(params)
+    return urlunparse(parsed._replace(query=query))
+
+
+def _metadata_value(metadata: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        if key in metadata and metadata[key] is not None:
+            return str(metadata[key])
+    return None
 
 
 def _llm_kwargs(
@@ -506,31 +681,176 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/auth/signup", response_model=AuthResponse)
+def signup(payload: AuthRequest, raw_request: Request) -> AuthResponse:
+    _rate_limit_auth(raw_request)
+    username = payload.username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9._-]{3,32}", username):
+        raise HTTPException(status_code=400, detail="Username must be 3-32 characters.")
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    user_id = str(uuid.uuid4())
+    try:
+        create_user(
+            user_id=user_id,
+            username=username,
+            password_hash=hash_password(payload.password),
+            tier="FREE",
+        )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="Username already taken.") from exc
+
+    touch_session(user_id)
+    token = create_token({"sub": user_id}, _auth_secret(), _token_ttl_seconds())
+    user = UserResponse(id=user_id, username=username, tier="FREE")
+    return AuthResponse(token=token, user=user)
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(payload: AuthRequest, raw_request: Request) -> AuthResponse:
+    _rate_limit_auth(raw_request)
+    username = payload.username.strip().lower()
+    user = get_user_by_username(username)
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
+
+    touch_session(user["id"])
+    token = create_token({"sub": user["id"]}, _auth_secret(), _token_ttl_seconds())
+    user_response = UserResponse(id=user["id"], username=user["username"], tier=user["tier"])
+    return AuthResponse(token=token, user=user_response)
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+def me(raw_request: Request) -> UserResponse:
+    user = _require_user(raw_request)
+    return UserResponse(id=user["id"], username=user["username"], tier=user["tier"])
+
+
+@app.post("/api/account/tier")
+def update_tier(payload: TierUpdateRequest, raw_request: Request) -> dict[str, str]:
+    user = _require_user(raw_request)
+    tier = _normalize_tier(payload.tier)
+    update_user_tier(user["id"], tier)
+    return {"tier": tier}
+
+
+@app.post("/api/payments/dodo/checkout-link", response_model=DodoCheckoutResponse)
+def create_dodo_checkout_link(
+    payload: DodoCheckoutRequest,
+    raw_request: Request,
+) -> DodoCheckoutResponse:
+    user = _require_user(raw_request)
+    tier = _normalize_tier(payload.tier)
+    if tier not in {"STARTER", "PRO"}:
+        raise HTTPException(status_code=400, detail="Unsupported tier.")
+    checkout_url = _build_dodo_checkout_url(_dodo_link_for_tier(tier), user["id"], tier)
+    return DodoCheckoutResponse(checkout_url=checkout_url)
+
+
+@app.post("/api/payments/dodo/webhook")
+async def dodo_webhook(request: Request) -> dict[str, bool]:
+    webhook_secret = _env("DODO_WEBHOOK_KEY")
+    if not webhook_secret:
+        raise HTTPException(status_code=500, detail="Dodo webhook is not configured.")
+
+    raw_body = await request.body()
+    headers = {
+        "webhook-id": request.headers.get("webhook-id", ""),
+        "webhook-signature": request.headers.get("webhook-signature", ""),
+        "webhook-timestamp": request.headers.get("webhook-timestamp", ""),
+    }
+
+    try:
+        Webhook(webhook_secret).verify(raw_body.decode("utf-8"), headers)
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    payload = json.loads(raw_body.decode("utf-8"))
+    data = payload.get("data") or {}
+    metadata = data.get("metadata") or payload.get("metadata") or {}
+    status = (data.get("status") or data.get("payment_status") or payload.get("status") or "").lower()
+
+    if status not in {"succeeded", "success", "paid", "completed"}:
+        return {"received": True}
+
+    user_id = _metadata_value(metadata, "user_id", "userId", "metadata_user_id")
+    tier = _metadata_value(metadata, "tier", "metadata_tier")
+    token = _metadata_value(metadata, "token", "metadata_token")
+    if not user_id or not tier:
+        return {"received": True}
+
+    tier = _normalize_tier(tier)
+    if tier not in {"STARTER", "PRO"}:
+        return {"received": True}
+
+    if token:
+        try:
+            token_payload = verify_token(token, _auth_secret())
+            if token_payload.get("sub") != user_id or _normalize_tier(
+                token_payload.get("tier")
+            ) != tier:
+                return {"received": True}
+        except ValueError:
+            return {"received": True}
+
+    if not get_user_by_id(user_id):
+        return {"received": True}
+
+    payment_id = (
+        data.get("payment_id")
+        or data.get("id")
+        or payload.get("payment_id")
+        or payload.get("id")
+        or str(uuid.uuid4())
+    )
+    stored = insert_payment(
+        payment_id=f"dodo:{payment_id}",
+        provider="dodo",
+        user_id=user_id,
+        tier=tier,
+        status=status,
+        raw=payload,
+    )
+    if stored:
+        update_user_tier(user_id, tier)
+
+    return {"received": True}
+
+
 @app.get("/api/usage", response_model=UsageResponse)
 def get_usage(raw_request: Request) -> UsageResponse:
-    session_id = _get_session_id(raw_request)
-    tier = _get_tier(raw_request)
-    touch_session(session_id)
-    week_start = get_week_start()
-    count = get_usage_count(session_id, week_start)
-    meta = _build_usage_meta(tier, count, week_start)
+    user = _require_user(raw_request)
+    tier = _effective_tier(raw_request, user)
+    user_id = user["id"]
+    _rate_limit(raw_request, tier, user_id)
+    touch_session(user_id)
+    period_start = get_day_start() if tier == "FREE" else get_week_start()
+    count = get_usage_count(user_id, period_start)
+    meta = _build_usage_meta(tier, count, period_start)
     return UsageResponse(**meta.model_dump())
 
 
 @app.post("/api/messagecraft", response_model=MessageCraftResponse)
 def messagecraft(request: MessageCraftRequest, raw_request: Request) -> MessageCraftResponse:
-    session_id = _get_session_id(raw_request)
-    tier = _get_tier(raw_request)
-    touch_session(session_id)
+    user = _require_user(raw_request)
+    tier = _effective_tier(raw_request, user)
+    user_id = user["id"]
+    _rate_limit(raw_request, tier, user_id)
+    touch_session(user_id)
 
-    week_start = get_week_start()
+    period_start = get_day_start() if tier == "FREE" else get_week_start()
     limit = TIER_LIMITS[tier]
-    count = get_usage_count(session_id, week_start)
+    count = get_usage_count(user_id, period_start)
     if limit is not None and count >= limit:
-        reset_at = get_next_week_start(week_start).isoformat()
+        reset_at = (
+            get_next_day_start(period_start)
+            if tier == "FREE"
+            else get_next_week_start(period_start)
+        ).isoformat()
         raise HTTPException(
             status_code=429,
-            detail={"message": "Weekly translation limit reached.", "reset_at": reset_at},
+            detail={"message": "Translation limit reached.", "reset_at": reset_at},
         )
 
     text = request.text.strip()
@@ -550,15 +870,17 @@ def messagecraft(request: MessageCraftRequest, raw_request: Request) -> MessageC
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    new_count = increment_usage(session_id, week_start, 1)
-    parsed.meta = _build_usage_meta(tier, new_count, week_start)
+    new_count = increment_usage(user_id, period_start, 1)
+    parsed.meta = _build_usage_meta(tier, new_count, period_start)
     return _apply_tier_limits(parsed, tier)
 
 
 @app.post("/api/conversations")
 def create_conversation(entry: ConversationEntryRequest, raw_request: Request) -> dict[str, str]:
-    session_id = _get_session_id(raw_request)
-    tier = _get_tier(raw_request)
+    user = _require_user(raw_request)
+    tier = _effective_tier(raw_request, user)
+    user_id = user["id"]
+    _rate_limit(raw_request, tier, user_id)
     if tier == "FREE":
         raise HTTPException(status_code=403, detail="Conversation memory is not available on Free.")
 
@@ -566,11 +888,11 @@ def create_conversation(entry: ConversationEntryRequest, raw_request: Request) -
     if not contact:
         raise HTTPException(status_code=400, detail="Contact is required.")
 
-    touch_session(session_id)
+    touch_session(user_id)
 
     limit = CONTACT_LIMITS[tier]
-    if limit is not None and not contact_exists(session_id, contact):
-        current_contacts = count_contacts(session_id)
+    if limit is not None and not contact_exists(user_id, contact):
+        current_contacts = count_contacts(user_id)
         if current_contacts >= limit:
             raise HTTPException(
                 status_code=403,
@@ -579,7 +901,7 @@ def create_conversation(entry: ConversationEntryRequest, raw_request: Request) -
 
     insert_conversation_entry(
         entry_id=str(uuid.uuid4()),
-        session_id=session_id,
+        session_id=user_id,
         contact=contact,
         input_text=entry.input_text,
         output_text=entry.output_text,
@@ -595,18 +917,23 @@ def create_conversation(entry: ConversationEntryRequest, raw_request: Request) -
 
 @app.get("/api/conversations")
 def list_conversations(raw_request: Request, contact: str | None = None) -> dict[str, Any]:
-    session_id = _get_session_id(raw_request)
-    tier = _get_tier(raw_request)
+    user = _require_user(raw_request)
+    tier = _effective_tier(raw_request, user)
+    user_id = user["id"]
+    _rate_limit(raw_request, tier, user_id)
     if tier == "FREE":
         return {"entries": []}
 
-    touch_session(session_id)
-    entries = fetch_conversation_entries(session_id=session_id, contact=contact)
+    touch_session(user_id)
+    entries = fetch_conversation_entries(session_id=user_id, contact=contact)
     return {"entries": entries}
 
 
 @app.post("/api/translate", response_model=TranslateResponse)
-def translate(request: TranslateRequest) -> TranslateResponse:
+def translate(request: TranslateRequest, raw_request: Request) -> TranslateResponse:
+    user = _require_user(raw_request)
+    tier = _effective_tier(raw_request, user)
+    _rate_limit(raw_request, tier, user["id"])
     text = request.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Missing input text.")
