@@ -239,7 +239,7 @@ def _parse_origins(value: str | None) -> list[str]:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_parse_origins(os.getenv("CORS_ORIGINS", "*")),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
