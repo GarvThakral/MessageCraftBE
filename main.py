@@ -512,7 +512,11 @@ def _build_messagecraft_prompt(request: MessageCraftRequest) -> str:
 
     return (
         "Return ONE JSON object that matches the schema exactly. No markdown or extra text. "
-        "Preserve intent. Do not add new facts, decisions, or requests. "
+        "Rewrite the input as if sent by the original speaker. Never reply or acknowledge it. "
+        "Preserve intent and point of view. Do not add new facts, decisions, or requests. "
+        "Every output string must be a rewrite (same speaker). No acknowledgments like "
+        "'Understood', 'Okay', 'Sure', 'I will', 'I won't', or 'Got it' unless those words "
+        "appear in the original input. "
         "If the input is ambiguous, keep it ambiguous. "
         "Keep length close to the original (about +/- 30%). Use short sentences. "
         "Avoid corporate or therapy jargon unless the input uses it. "
@@ -532,12 +536,17 @@ def _build_prompt(mode: str) -> str:
     if mode == "logic":
         return (
             "Convert emotional text into calm, logical, NVC-style communication. "
+            "Rewrite as the original speaker. Never reply or acknowledge the message. "
+            "No acknowledgment phrases like 'Understood', 'Okay', 'Sure', 'I will', or 'Got it'. "
             "Keep it concise, respectful, and specific."
         )
     if mode == "emotion":
         return (
             "Convert overly logical or dismissive text into warm, emotionally "
-            "validating language. Keep it concise, genuine, and non-blaming."
+            "validating language. Rewrite as the original speaker. "
+            "Never reply or acknowledge the message. "
+            "No acknowledgment phrases like 'Understood', 'Okay', 'Sure', 'I will', or 'Got it'. "
+            "Keep it concise, genuine, and non-blaming."
         )
     raise HTTPException(status_code=400, detail="Unsupported mode.")
 
