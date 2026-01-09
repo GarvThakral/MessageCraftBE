@@ -282,6 +282,15 @@ class ResyncPaymentRequest(BaseModel):
     payment_id: str | None = None
 
 
+class SupportRequest(BaseModel):
+    name: str
+    email: str
+    subject: str
+    message: str
+    category: str | None = None
+    order_id: str | None = None
+
+
 class DodoCheckoutRequest(BaseModel):
     tier: str
 
@@ -683,12 +692,19 @@ def _smtp_settings() -> dict[str, Any]:
     }
 
 
-def _send_email(to_address: str, subject: str, body: str) -> None:
+def _send_email(
+    to_address: str,
+    subject: str,
+    body: str,
+    reply_to: str | None = None,
+) -> None:
     settings = _smtp_settings()
     message = EmailMessage()
     message["From"] = settings["sender"]
     message["To"] = to_address
     message["Subject"] = subject
+    if reply_to:
+        message["Reply-To"] = reply_to
     message.set_content(body)
     with smtplib.SMTP(settings["host"], settings["port"]) as smtp:
         if settings["use_tls"]:
@@ -728,6 +744,13 @@ def _send_password_reset_email(to_address: str, token: str) -> None:
         "Reset your MessageCraft Pro password",
         f"Reset your password here: {_password_reset_link(token)}",
     )
+
+
+def _support_email_to() -> str:
+    address = _env("SUPPORT_EMAIL_TO")
+    if not address:
+        raise RuntimeError("SUPPORT_EMAIL_TO is not set.")
+    return address
 
 
 def _alert_admin(subject: str, body: str) -> None:
@@ -930,6 +953,19 @@ def _rate_limit_login_email(request: Request, email: str) -> None:
         raise HTTPException(
             status_code=429,
             detail="Too many login attempts. Please wait before trying again.",
+        )
+
+
+def _rate_limit_support(request: Request) -> None:
+    ip = _get_client_ip(request)
+    if not ip:
+        return
+    window_start = _window_start(60)
+    count = increment_rate_limit(f"support:{ip}", window_start)
+    if count > 5:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many support requests. Please try again later.",
         )
 
 
@@ -1576,6 +1612,38 @@ def reset_password(payload: ResetPasswordRequest) -> dict[str, bool]:
     return {"reset": True}
 
 
+@app.post("/api/support/contact")
+def support_contact(payload: SupportRequest, raw_request: Request) -> dict[str, bool]:
+    _rate_limit_support(raw_request)
+    name = payload.name.strip()
+    email = payload.email.strip().lower()
+    subject = payload.subject.strip()
+    message = payload.message.strip()
+    if not name or not subject or not message:
+        raise HTTPException(status_code=400, detail="Name, subject, and message are required.")
+    if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+", email):
+        raise HTTPException(status_code=400, detail="Email address is invalid.")
+    if len(message) > 5000:
+        raise HTTPException(status_code=400, detail="Message is too long.")
+    category = payload.category.strip() if payload.category else "general"
+    order_id = payload.order_id.strip() if payload.order_id else "n/a"
+    body = (
+        "New support request\n"
+        f"Name: {name}\n"
+        f"Email: {email}\n"
+        f"Category: {category}\n"
+        f"Order ID: {order_id}\n\n"
+        "Message:\n"
+        f"{message}\n"
+    )
+    try:
+        _send_email(_support_email_to(), f"[Support] {subject}", body, reply_to=email)
+    except Exception as exc:
+        logger.exception("Failed to send support email.")
+        raise HTTPException(status_code=500, detail="Support email failed.") from exc
+    return {"sent": True}
+
+
 @app.post("/api/account/tier")
 def update_tier(payload: TierUpdateRequest, raw_request: Request) -> dict[str, str]:
     _require_user(raw_request)
@@ -1648,6 +1716,9 @@ def create_dodo_checkout_link(
     tier = _normalize_tier(payload.tier)
     if tier not in {"STARTER", "PRO"}:
         raise HTTPException(status_code=400, detail="Unsupported tier.")
+    current_tier = _normalize_tier(user.get("tier"))
+    if current_tier == TIER_PRO and tier == TIER_STARTER:
+        raise HTTPException(status_code=403, detail="Already on Pro.")
     checkout_url = _build_dodo_checkout_url(_dodo_link_for_tier(tier), user["id"], tier)
     return DodoCheckoutResponse(checkout_url=checkout_url)
 
