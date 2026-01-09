@@ -5,3 +5,4 @@ psycopg[binary]
 langchain
 langchain-openai
 standardwebhooks
+requests

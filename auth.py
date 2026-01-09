@@ -19,12 +19,14 @@ def _b64decode(data: str) -> bytes:
 
 
 def hash_password(password: str) -> str:
+    """Hash a password with a per-user salt using PBKDF2-HMAC-SHA256."""
     salt = secrets.token_bytes(16)
     hashed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
     return base64.b64encode(salt + hashed).decode("utf-8")
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify a plaintext password against a stored PBKDF2-HMAC-SHA256 hash."""
     raw = base64.b64decode(stored_hash.encode("utf-8"))
     salt = raw[:16]
     expected = raw[16:]
@@ -33,6 +35,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def create_token(payload: dict[str, Any], secret: str, ttl_seconds: int) -> str:
+    """Create a signed, expiring token payload using HMAC-SHA256."""
     data = dict(payload)
     data["exp"] = int(time.time()) + ttl_seconds
     body = _b64encode(json.dumps(data, separators=(",", ":")).encode("utf-8"))
@@ -41,6 +44,7 @@ def create_token(payload: dict[str, Any], secret: str, ttl_seconds: int) -> str:
 
 
 def verify_token(token: str, secret: str) -> dict[str, Any]:
+    """Verify token signature and expiry, returning the payload if valid."""
     try:
         body, signature = token.split(".", 1)
     except ValueError as exc:  # pragma: no cover
@@ -56,3 +60,13 @@ def verify_token(token: str, secret: str) -> dict[str, Any]:
         raise ValueError("Token expired.")
 
     return payload
+
+
+def generate_refresh_token() -> str:
+    """Generate a high-entropy refresh token for rotation-based sessions."""
+    return secrets.token_urlsafe(48)
+
+
+def hash_token(token: str) -> str:
+    """Hash a token using SHA256 for storage and comparison."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
